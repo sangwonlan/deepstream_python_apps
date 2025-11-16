@@ -30,6 +30,37 @@ from common.platform_info import PlatformInfo
 from common.bus_call import bus_call
 from common.utils import long_to_uint64
 import pyds
+import time
+import yaml
+
+from src.zone_logic_simple import SimpleZoneMonitor, ZoneConfigSimple, ThresholdsSimple
+from src.storage import write_status
+from src.alerts import console_alert
+from src.zone_logic_simple import SimpleZoneMonitor, ZoneConfig, ZoneThresholds
+
+def load_zone_cfg_simple(path: str) -> ZoneConfigSimple:
+    # configs/zones/minimal_room.yaml 파일을 읽어서
+    # 침대 좌표 + 임계값을 ZoneConfigSimple 형태로 바꿔주는 함수
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    th = cfg.get("thresholds", {})
+
+    thresholds = ThresholdsSimple(
+        d2_edge=th.get("d2_edge", 40.0),
+        T_alert=th.get("T_alert", 12.0),
+        cooldown_sec=th.get("cooldown_sec", 30.0),
+    )
+
+    # bed_polygon에 네가 YAML에 넣어둔 4개 점이 그대로 들어옴
+    bed_poly = [(float(x), float(y)) for x, y in cfg["bed_polygon"]]
+
+    return ZoneConfigSimple(
+        bed_polygon=bed_poly,
+        thresholds=thresholds,
+        camera_id=cfg.get("camera_id", "cam01"),
+        fps=cfg.get("fps", 30.0),
+    )
 
 MAX_DISPLAY_LEN = 64
 MAX_TIME_STAMP_LEN = 32
