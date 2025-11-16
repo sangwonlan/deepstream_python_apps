@@ -1,0 +1,11 @@
+camera_id: "cam01"
+fps: 30
+bed_polygon:
+  - [160, 200]   # 좌상
+  - [1120, 190]  # 우상
+  - [1125, 670]  # 우하
+  - [155, 680]   # 좌하
+thresholds:
+  d2_edge: 40    # 엣지 근처로 볼 픽셀 거리(Zone1 폭)
+  T_alert: 12    # Zone1 안에 이 시간(초) 이상 있으면 Alert
+  cooldown_sec: 30
