@@ -18,25 +18,34 @@
 ################################################################################
 
 import sys
+import os
 
-sys.path.append('../')
+# deepstream_python_apps/common 모듈 쓸 수 있게 상위 폴더 추가
+sys.path.append("../")
+
 import gi
-
-gi.require_version('Gst', '1.0')
+gi.require_version("Gst", "1.0")
 from gi.repository import GLib, Gst
-import sys
+
 from optparse import OptionParser
+
 from common.platform_info import PlatformInfo
 from common.bus_call import bus_call
 from common.utils import long_to_uint64
+
 import pyds
 import time
 import yaml
 
+# 👉 네가 만든 전낙상 로직 / 설정 타입
 from src.zone_logic_simple import SimpleZoneMonitor, ZoneConfigSimple, ThresholdsSimple
+
+# 👉 상태 JSON / 타임라인 CSV 저장
 from src.storage import write_status
+
+# 👉 콘솔에 ALERT 찍을 때 사용
 from src.alerts import console_alert
-from src.zone_logic_simple import SimpleZoneMonitor, ZoneConfig, ZoneThresholds
+
 
 def load_zone_cfg_simple(path: str) -> ZoneConfigSimple:
     # configs/zones/minimal_room.yaml 파일을 읽어서
@@ -264,6 +273,25 @@ def main(args):
     platform_info = PlatformInfo()
     Gst.init(None)
 
+    # === Bedwatch Zone1 설정 불러오기 & 모니터 생성 ===
+    zone_cfg_path = os.path.join(
+        os.path.dirname(__file__),
+        "configs",
+        "zones",
+        "minimal_room.yaml",
+    )
+    zone_cfg = load_zone_cfg_simple(zone_cfg_path)
+    zone_monitor = SimpleZoneMonitor(zone_cfg)
+
+    # pad-probe에 같이 넘길 데이터 묶음
+    user_data = {
+        "zone_monitor": zone_monitor,
+        "camera_id": getattr(zone_cfg, "camera_id", "cam01"),
+        "fps_hint": getattr(zone_cfg, "fps", 30.0),
+        # 사람 class_id (PeopleNet 기본 0, 모델에 따라 조정 가능)
+        "person_class_id": PGIE_CLASS_ID_PERSON,
+    }
+
     # Deprecated: following meta_copy_func and meta_free_func
     # have been moved to the binding as event_msg_meta_copy_func()
     # and event_msg_meta_release_func() respectively.
@@ -353,21 +381,21 @@ def main(args):
                 sys.stderr.write(" Unable to create egl sink \n")
 
     print("Playing file %s " % input_file)
-    source.set_property('location', input_file)
-    streammux.set_property('width', 1920)
-    streammux.set_property('height', 1080)
-    streammux.set_property('batch-size', 1)
-    streammux.set_property('batched-push-timeout', MUXER_BATCH_TIMEOUT_USEC)
-    pgie.set_property('config-file-path', PGIE_CONFIG_FILE)
-    msgconv.set_property('config', MSCONV_CONFIG_FILE)
-    msgconv.set_property('payload-type', schema_type)
-    msgbroker.set_property('proto-lib', proto_lib)
-    msgbroker.set_property('conn-str', conn_str)
+    source.set_property("location", input_file)
+    streammux.set_property("width", 1920)
+    streammux.set_property("height", 1080)
+    streammux.set_property("batch-size", 1)
+    streammux.set_property("batched-push-timeout", MUXER_BATCH_TIMEOUT_USEC)
+    pgie.set_property("config-file-path", PGIE_CONFIG_FILE)
+    msgconv.set_property("config", MSCONV_CONFIG_FILE)
+    msgconv.set_property("payload-type", schema_type)
+    msgbroker.set_property("proto-lib", proto_lib)
+    msgbroker.set_property("conn-str", conn_str)
     if cfg_file is not None:
-        msgbroker.set_property('config', cfg_file)
+        msgbroker.set_property("config", cfg_file)
     if topic is not None:
-        msgbroker.set_property('topic', topic)
-    msgbroker.set_property('sync', False)
+        msgbroker.set_property("topic", topic)
+    msgbroker.set_property("sync", False)
 
     print("Adding elements to Pipeline \n")
     pipeline.add(source)
@@ -404,7 +432,7 @@ def main(args):
     msgconv.link(msgbroker)
     queue2.link(sink)
     sink_pad = queue1.get_static_pad("sink")
-    tee_msg_pad = tee.request_pad_simple('src_%u')
+    tee_msg_pad = tee.request_pad_simple("src_%u")
     tee_render_pad = tee.request_pad_simple("src_%u")
     if not tee_msg_pad or not tee_render_pad:
         sys.stderr.write("Unable to get request pads\n")
@@ -422,20 +450,26 @@ def main(args):
     if not osdsinkpad:
         sys.stderr.write(" Unable to get sink pad of nvosd \n")
 
-    osdsinkpad.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, 0)
+    # Bedwatch용 pad-probe: user_data에 zone_monitor 등 정보를 담아서 넘김
+    osdsinkpad.add_probe(
+        Gst.PadProbeType.BUFFER,
+        osd_sink_pad_buffer_probe,
+        user_data,
+    )
 
     print("Starting pipeline \n")
 
-    # start play back and listed to events
+    # start play back and listen to events
     pipeline.set_state(Gst.State.PLAYING)
     try:
         loop.run()
     except:
         pass
+
     # cleanup
-    
-    #pyds.unset_callback_funcs()
+    # pyds.unset_callback_funcs()
     pipeline.set_state(Gst.State.NULL)
+
 
 
 # Parse and validate input arguments
