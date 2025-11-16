@@ -38,7 +38,8 @@ import time
 import yaml
 
 # 👉 네가 만든 전낙상 로직 / 설정 타입
-from src.zone_logic_simple import SimpleZoneMonitor, ZoneConfigSimple, ThresholdsSimple
+from src.zone_logic_simple import SimpleZoneMonitor, load_zone_config
+
 
 # 👉 상태 JSON / 타임라인 CSV 저장
 from src.storage import write_status
@@ -46,30 +47,6 @@ from src.storage import write_status
 # 👉 콘솔에 ALERT 찍을 때 사용
 from src.alerts import console_alert
 
-
-def load_zone_cfg_simple(path: str) -> ZoneConfigSimple:
-    # configs/zones/minimal_room.yaml 파일을 읽어서
-    # 침대 좌표 + 임계값을 ZoneConfigSimple 형태로 바꿔주는 함수
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    th = cfg.get("thresholds", {})
-
-    thresholds = ThresholdsSimple(
-        d2_edge=th.get("d2_edge", 40.0),
-        T_alert=th.get("T_alert", 12.0),
-        cooldown_sec=th.get("cooldown_sec", 30.0),
-    )
-
-    # bed_polygon에 네가 YAML에 넣어둔 4개 점이 그대로 들어옴
-    bed_poly = [(float(x), float(y)) for x, y in cfg["bed_polygon"]]
-
-    return ZoneConfigSimple(
-        bed_polygon=bed_poly,
-        thresholds=thresholds,
-        camera_id=cfg.get("camera_id", "cam01"),
-        fps=cfg.get("fps", 30.0),
-    )
 
 MAX_DISPLAY_LEN = 64
 MAX_TIME_STAMP_LEN = 32
@@ -92,6 +69,8 @@ PGIE_CONFIG_FILE = "dstest4_pgie_config.txt"
 MSCONV_CONFIG_FILE = "dstest4_msgconv_config.txt"
 
 pgie_classes_str = ["Vehicle", "TwoWheeler", "Person", "Roadsign"]
+
+OUTPUT_STATUS_PATH = os.path.join(os.path.dirname(__file__), "output", "status.json")
 
 def generate_vehicle_meta(data):
     obj = pyds.NvDsVehicleObject.cast(data)
@@ -153,119 +132,123 @@ def generate_event_msg_meta(data, class_id):
 #    (info.get_buffer()) from traversing the pipeline until user return.
 # b) loops inside probe() callback could be costly in python.
 #    So users shall optimize according to their use-case.
+# osd_sink_pad_buffer_probe  will extract metadata received on OSD sink pad
+# and update params for drawing rectangle, object information etc.
 def osd_sink_pad_buffer_probe(pad, info, u_data):
+    """
+    DeepStream가 프레임마다 부르는 콜백.
+    여기서:
+      - 사람(person) 객체만 골라서
+      - 침대 Zone1 전낙상 로직(SimpleZoneMonitor)에 넣고
+      - 박스 색(초록/노랑/빨강) 바꾸고
+      - status.json에 상태를 기록한다.
+    """
     frame_number = 0
-    # Intiallizing object counter with 0.
-    obj_counter = {
-        PGIE_CLASS_ID_VEHICLE: 0,
-        PGIE_CLASS_ID_PERSON: 0,
-        PGIE_CLASS_ID_BICYCLE: 0,
-        PGIE_CLASS_ID_ROADSIGN: 0
-    }
+
+    # u_data: main()에서 넘긴 딕셔너리 (zone_monitor, camera_id, fps_hint, person_class_id)
+    if u_data is None:
+        return Gst.PadProbeReturn.OK
+
+    zone_monitor: SimpleZoneMonitor = u_data.get("zone_monitor")
+    camera_id = u_data.get("camera_id", "cam01")
+    fps_hint = float(u_data.get("fps_hint", 30.0))
+    person_class_id = int(u_data.get("person_class_id", PGIE_CLASS_ID_PERSON))
+
+    # 프레임 간 시간 간격(dt)을 단순히 fps로부터 추정 (예: 30fps → 1/30초)
+    dt = 1.0 / fps_hint if fps_hint > 0 else 1.0 / 30.0
+
     gst_buffer = info.get_buffer()
     if not gst_buffer:
         print("Unable to get GstBuffer ")
-        return
+        return Gst.PadProbeReturn.OK
 
-    # Retrieve batch metadata from the gst_buffer
-    # Note that pyds.gst_buffer_get_nvds_batch_meta() expects the
-    # C address of gst_buffer as input, which is obtained with hash(gst_buffer)
+    # DeepStream 메타데이터(batch_meta) 가져오기
     batch_meta = pyds.gst_buffer_get_nvds_batch_meta(hash(gst_buffer))
     if not batch_meta:
         return Gst.PadProbeReturn.OK
+
+    # 프레임들 순회
     l_frame = batch_meta.frame_meta_list
     while l_frame is not None:
         try:
-            # Note that l_frame.data needs a cast to pyds.NvDsFrameMeta
-            # The casting is done by pyds.NvDsFrameMeta.cast()
-            # The casting also keeps ownership of the underlying memory
-            # in the C code, so the Python garbage collector will leave
-            # it alone.
             frame_meta = pyds.NvDsFrameMeta.cast(l_frame.data)
         except StopIteration:
-            continue
-        is_first_object = True
-
-        # Short example of attribute access for frame_meta:
-        # print("Frame Number is ", frame_meta.frame_num)
-        # print("Source id is ", frame_meta.source_id)
-        # print("Batch id is ", frame_meta.batch_id)
-        # print("Source Frame Width ", frame_meta.source_frame_width)
-        # print("Source Frame Height ", frame_meta.source_frame_height)
-        # print("Num object meta ", frame_meta.num_obj_meta)
+            break
 
         frame_number = frame_meta.frame_num
+
+        # 이 프레임 안의 객체들 순회
         l_obj = frame_meta.obj_meta_list
         while l_obj is not None:
             try:
                 obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
             except StopIteration:
-                continue
+                break
 
-            # Update the object text display
-            txt_params = obj_meta.text_params
+            # DeepStream이 붙여준 class_id 기준으로 "사람"만 전낙상 로직에 사용
+            if obj_meta.class_id == person_class_id and zone_monitor is not None:
+                rect = obj_meta.rect_params
+                bbox = (rect.left, rect.top, rect.width, rect.height)
 
-            # Set display_text. Any existing display_text string will be
-            # freed by the bindings module.
-            txt_params.display_text = pgie_classes_str[obj_meta.class_id]
+                # 👇 네가 만든 전낙상 뇌 호출 (Zone1만 사용하는 SimpleZoneMonitor)
+                res = zone_monitor.update(bbox=bbox, dt=dt)
 
-            obj_counter[obj_meta.class_id] += 1
+                in_zone1 = bool(res.get("in_zone1", False))
+                dwell = float(res.get("dwell", 0.0))
+                level = res.get("level", "SAFE")  # "SAFE" / "PREFALL_SHORT" / "PREFALL_ALERT"
 
-            # Font , font-color and font-size
-            txt_params.font_params.font_name = "Serif"
-            txt_params.font_params.font_size = 10
-            # set(red, green, blue, alpha); set to White
-            txt_params.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
+                # --- 박스 스타일 바꾸기 ---
+                rect.border_width = 3
+                if level == "SAFE":
+                    # 초록
+                    rect.border_color.set(0.0, 1.0, 0.0, 1.0)
+                elif level == "PREFALL_SHORT":
+                    # 노랑
+                    rect.border_color.set(1.0, 1.0, 0.0, 1.0)
+                elif level == "PREFALL_ALERT":
+                    # 빨강
+                    rect.border_color.set(1.0, 0.0, 0.0, 1.0)
 
-            # Text background color
-            txt_params.set_bg_clr = 1
-            # set(red, green, blue, alpha); set to Black
-            txt_params.text_bg_clr.set(0.0, 0.0, 0.0, 1.0)
+                # --- 화면에 표시되는 텍스트 업데이트 ---
+                txt_params = obj_meta.text_params
+                txt_params.display_text = f"Person | {level} {dwell:.1f}s"
+                txt_params.font_params.font_name = "Serif"
+                txt_params.font_params.font_size = 10
+                txt_params.font_params.font_color.set(1.0, 1.0, 1.0, 1.0)
+                txt_params.set_bg_clr = 1
+                txt_params.text_bg_clr.set(0.0, 0.0, 0.0, 0.8)
 
-            # Ideally NVDS_EVENT_MSG_META should be attached to buffer by the
-            # component implementing detection / recognition logic.
-            # Here it demonstrates how to use / attach that meta data.
-            if is_first_object and (frame_number % 30) == 0:
-                # Frequency of messages to be send will be based on use case.
-                # Here message is being sent for first object every 30 frames.
+                # --- 상태 파일(status.json)로 기록 ---
+                try:
+                    write_status(
+                        OUTPUT_STATUS_PATH,
+                        camera_id=camera_id,
+                        track_id=int(obj_meta.object_id),
+                        prefall=in_zone1,
+                        dwell=dwell,
+                    )
+                except Exception as e:
+                    print("write_status error:", e)
 
-                user_event_meta = pyds.nvds_acquire_user_meta_from_pool(
-                    batch_meta)
-                if user_event_meta:
-                    # Allocating an NvDsEventMsgMeta instance and getting
-                    # reference to it. The underlying memory is not manged by
-                    # Python so that downstream plugins can access it. Otherwise
-                    # the garbage collector will free it when this probe exits.
-                    msg_meta = pyds.alloc_nvds_event_msg_meta(user_event_meta)
-                    msg_meta.bbox.top = obj_meta.rect_params.top
-                    msg_meta.bbox.left = obj_meta.rect_params.left
-                    msg_meta.bbox.width = obj_meta.rect_params.width
-                    msg_meta.bbox.height = obj_meta.rect_params.height
-                    msg_meta.frameId = frame_number
-                    msg_meta.trackingId = long_to_uint64(obj_meta.object_id)
-                    msg_meta.confidence = obj_meta.confidence
-                    msg_meta = generate_event_msg_meta(msg_meta, obj_meta.class_id)
+                # --- ALERT면 콘솔에도 한 번 찍어주기 ---
+                if level == "PREFALL_ALERT":
+                    try:
+                        console_alert(camera_id, int(obj_meta.object_id), dwell)
+                    except Exception as e:
+                        print("console_alert error:", e)
 
-                    user_event_meta.user_meta_data = msg_meta
-                    user_event_meta.base_meta.meta_type = pyds.NvDsMetaType.NVDS_EVENT_MSG_META
-                    pyds.nvds_add_user_meta_to_frame(frame_meta,
-                                                     user_event_meta)
-                else:
-                    print("Error in attaching event meta to buffer\n")
-
-                is_first_object = False
+            # 다음 객체로
             try:
                 l_obj = l_obj.next
             except StopIteration:
                 break
+
+        # 다음 프레임으로
         try:
             l_frame = l_frame.next
         except StopIteration:
             break
 
-    print("Frame Number =", frame_number, "Vehicle Count =",
-          obj_counter[PGIE_CLASS_ID_VEHICLE], "Person Count =",
-          obj_counter[PGIE_CLASS_ID_PERSON])
     return Gst.PadProbeReturn.OK
 
 
@@ -275,12 +258,14 @@ def main(args):
 
     # === Bedwatch Zone1 설정 불러오기 & 모니터 생성 ===
     zone_cfg_path = os.path.join(
-        os.path.dirname(__file__),
-        "configs",
-        "zones",
-        "minimal_room.yaml",
+    os.path.dirname(__file__),
+    "configs",
+    "zones",
+    "minimal_room.yaml",
     )
-    zone_cfg = load_zone_cfg_simple(zone_cfg_path)
+
+
+    zone_cfg = load_zone_config(zone_cfg_path)
     zone_monitor = SimpleZoneMonitor(zone_cfg)
 
     # pad-probe에 같이 넘길 데이터 묶음
